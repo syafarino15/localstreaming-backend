@@ -1,0 +1,1486 @@
+openapi: 3.0.3
+info:
+  title: StayIn — DLU X ALFATEVE
+  version: 2.0.0
+  description: |
+    API for the DLU X ALFATEVE onboard entertainment system.
+
+    The product runs as TWO applications backed by TWO separate PostgreSQL
+    databases:
+
+    * **main / server utama** — `stayin_main`: CMS authoring, master catalog,
+      tenant and user management, distribution queue.
+    * **local / server lokal kapal** — `stayin_local`: TV API, streaming,
+      `mst_movie_local` (real files), rooms, layout, announcements.
+
+    `APP_MODE=combined` runs both in one process for development; `main` and
+    `local` expose only their own route family. A master catalog row carries no
+    filesystem fields: only `mst_movie_local` knows where a file lives.
+
+    Every JSON response uses one envelope:
+
+    * success: `{ "success": true, "message": string, "data": any, "meta"?: Pagination }`
+    * failure: `{ "success": false, "message": string, "errors"?: [{ "field": string, "message": string }] }`
+
+    Media streaming is the only endpoint that does not use the envelope: it
+    returns the raw file with HTTP byte-range semantics (`206 Partial Content`,
+    `Content-Range`, `Accept-Ranges: bytes`).
+  license:
+    name: Proprietary
+servers:
+  - url: http://192.168.1.10:8080
+    description: Local edge node on the ship LAN
+  - url: http://127.0.0.1:8080
+    description: Development
+
+tags:
+  - name: Auth
+  - name: Device
+  - name: Media
+  - name: Admin
+  - name: Tenant
+  - name: Node
+  - name: Health
+
+components:
+  securitySchemes:
+    adminAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access token from `POST /auth/login`. Also accepted as the `access_token` httpOnly cookie.
+    deviceToken:
+      type: apiKey
+      in: header
+      name: X-Device-Token
+      description: Long lived credential issued by `POST /auth/device/pair`.
+
+  parameters:
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+    TenantID:
+      name: tenantID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    MovieID:
+      name: movieID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    RoomID:
+      name: roomID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    DeviceID:
+      name: deviceID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  schemas:
+    Pagination:
+      type: object
+      properties:
+        page: { type: integer }
+        limit: { type: integer }
+        total_data: { type: integer, format: int64 }
+        total_page: { type: integer }
+
+    FieldError:
+      type: object
+      properties:
+        field: { type: string }
+        message: { type: string }
+
+    ErrorEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, enum: [false] }
+        message: { type: string }
+        errors:
+          type: array
+          items: { $ref: '#/components/schemas/FieldError' }
+
+    Tenant:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        slug: { type: string, example: dlu-alfateve }
+        name: { type: string, example: DLU X ALFATEVE }
+        branding: { type: object, additionalProperties: true }
+        license_quota: { type: integer, example: 50 }
+        status: { type: string, enum: [ACTIVE, SUSPENDED] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        email: { type: string, format: email }
+        full_name: { type: string }
+        role: { type: string, enum: [SUPER_ADMIN, TENANT_ADMIN] }
+        status: { type: string, enum: [ACTIVE, DISABLED] }
+        last_login_at: { type: string, format: date-time, nullable: true }
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, format: password }
+
+    LoginResponse:
+      type: object
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        token_type: { type: string, example: Bearer }
+        expires_in: { type: integer, format: int64 }
+        user: { $ref: '#/components/schemas/User' }
+
+    DevicePairRequest:
+      type: object
+      required: [device_uid, pairing_code]
+      properties:
+        device_uid: { type: string, example: EMU-DLU-TV-101 }
+        pairing_code: { type: string, example: '101001' }
+        model: { type: string, example: Android TV Emulator }
+        app_version: { type: string, example: 1.0.0 }
+
+    DevicePairResponse:
+      type: object
+      properties:
+        device_token: { type: string }
+        device_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        status: { type: string, enum: [ONLINE] }
+        room_id: { type: string, format: uuid, nullable: true }
+
+    Device:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        room_id: { type: string, format: uuid, nullable: true }
+        device_uid: { type: string }
+        label: { type: string }
+        model: { type: string }
+        app_version: { type: string }
+        pairing_code: { type: string, nullable: true }
+        status: { type: string, enum: [UNPAIRED, ONLINE, OFFLINE, DISABLED] }
+        ip_address: { type: string }
+        last_seen_at: { type: string, format: date-time, nullable: true }
+
+    RoomInfo:
+      type: object
+      properties:
+        room_number: { type: string, example: VIP-01 }
+        deck: { type: string }
+        room_type: { type: string, enum: [STANDARD, EXCLUSIVE, VIP] }
+        is_exclusive: { type: boolean }
+        guest_name: { type: string }
+        guest_salutation: { type: string }
+        greeting: { type: string, description: 'Template variables already substituted.' }
+
+    WelcomeScreen:
+      type: object
+      description: Welcome (opening) screen only. Catalog composition is not part of this document.
+      properties:
+        enabled: { type: boolean }
+        layout_variant: { type: string, enum: [SPLIT_LEFT_CARD, FULLSCREEN_CENTER, BOTTOM_OVERLAY] }
+        background_image_url: { type: string }
+        logo_url: { type: string }
+        primary_color: { type: string, example: '#0F4C81' }
+        accent_color: { type: string, example: '#F59E0B' }
+        cta_button_text: { type: string }
+        default_greeting: { type: string }
+        show_room_info: { type: boolean }
+        show_clock: { type: boolean }
+        overscan_percent: { type: integer, example: 4 }
+
+    LayoutConfig:
+      type: object
+      properties:
+        tenant_id: { type: string }
+        app_title: { type: string }
+        welcome_screen: { $ref: '#/components/schemas/WelcomeScreen' }
+
+    MovieCard:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        year: { type: integer }
+        duration_seconds: { type: integer }
+        genres:
+          type: array
+          items: { type: string }
+        poster_url: { type: string }
+        banner_url: { type: string }
+        stream_url: { type: string, example: /api/v1/stream/15f37066-a35f-40bc-bf8a-73b16ba2bc37 }
+        source: { type: string, enum: [CLOUD, FLASHDISK] }
+        is_featured: { type: boolean }
+        has_subtitle: { type: boolean }
+
+    MovieDetail:
+      allOf:
+        - $ref: '#/components/schemas/MovieCard'
+        - type: object
+          properties:
+            synopsis: { type: string }
+            tagline: { type: string }
+            director: { type: string }
+            cast:
+              type: array
+              items: { type: string }
+            country: { type: string }
+            original_language: { type: string }
+            age_rating: { type: string }
+            quality: { type: string }
+            audio_tracks:
+              type: array
+              items:
+                type: object
+                properties:
+                  language: { type: string }
+                  label: { type: string }
+            subtitles:
+              type: array
+              items:
+                type: object
+                properties:
+                  language: { type: string }
+                  label: { type: string }
+                  path: { type: string }
+            file_size_bytes: { type: integer, format: int64 }
+            container: { type: string }
+            checksum_sha256: { type: string }
+
+    Movie:
+      type: object
+      description: Master catalog entry from stayin_main. It never carries filesystem fields.
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        slug: { type: string }
+        title: { type: string }
+        year: { type: integer }
+        duration_seconds: { type: integer }
+        genres:
+          type: array
+          items: { type: string }
+        poster_path: { type: string, description: 'Relative to media root, e.g. Movies/poster.jpg' }
+        banner_path: { type: string }
+        is_featured: { type: boolean }
+        sort_order: { type: integer }
+        status:
+          type: string
+          enum: [DRAFT, PENDING, PUBLISHED, ARCHIVED]
+          description: Authoring stage, not file readiness.
+
+    MovieLocal:
+      type: object
+      description: Physical file on one ship server (stayin_local.mst_movie_local).
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        movie_id: { type: string, format: uuid }
+        node_code: { type: string }
+        status: { type: string, enum: [PENDING, TRANSFERRING, READY, MISSING, FAILED] }
+        source: { type: string, enum: [CLOUD, FLASHDISK] }
+        expected_filename: { type: string }
+        file_path: { type: string, description: 'Relative to media root.' }
+        file_size_bytes: { type: integer, format: int64 }
+        checksum_sha256: { type: string }
+        container: { type: string }
+        progress_bytes: { type: integer, format: int64 }
+        error: { type: string }
+        assigned_at: { type: string, format: date-time }
+        transfer_started_at: { type: string, format: date-time, nullable: true }
+        ready_at: { type: string, format: date-time, nullable: true }
+        scanned_at: { type: string, format: date-time, nullable: true }
+
+    MovieWithLocal:
+      type: object
+      properties:
+        movie: { $ref: '#/components/schemas/Movie' }
+        local: { allOf: [{ $ref: '#/components/schemas/MovieLocal' }], nullable: true }
+
+    CatalogView:
+      type: object
+      properties:
+        featured:
+          allOf:
+            - $ref: '#/components/schemas/MovieCard'
+          nullable: true
+        rows:
+          type: array
+          items:
+            type: object
+            properties:
+              genre: { type: string }
+              display_style: { type: string }
+              movies:
+                type: array
+                items: { $ref: '#/components/schemas/MovieCard' }
+        genres:
+          type: array
+          items: { type: string }
+        total: { type: integer }
+
+    TVInitResponse:
+      type: object
+      properties:
+        device: { $ref: '#/components/schemas/Device' }
+        room:
+          allOf:
+            - $ref: '#/components/schemas/RoomInfo'
+          nullable: true
+        tenant: { $ref: '#/components/schemas/Tenant' }
+        layout_config: { $ref: '#/components/schemas/LayoutConfig' }
+        catalog: { $ref: '#/components/schemas/CatalogView' }
+        announcements:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              message: { type: string }
+              severity: { type: string, enum: [INFO, WARNING, EMERGENCY] }
+        server:
+          type: object
+          properties:
+            node_code: { type: string }
+            app_mode: { type: string }
+            server_time: { type: string, format: date-time }
+            heartbeat_interval_seconds: { type: integer }
+            catalog_version: { type: integer }
+            streaming_mode: { type: string, example: byte-range }
+
+    HeartbeatRequest:
+      type: object
+      properties:
+        app_version: { type: string }
+        playing_movie_id: { type: string }
+        state: { type: string, enum: [WELCOME, CATALOG, DETAIL, PLAYER, IDLE] }
+
+    WatchLogRequest:
+      type: object
+      required: [movie_id]
+      properties:
+        movie_id: { type: string, format: uuid }
+        position_seconds: { type: integer }
+        duration_seconds: { type: integer }
+        completed: { type: boolean }
+
+    CommandRequest:
+      type: object
+      required: [command]
+      properties:
+        command:
+          type: string
+          enum: [REFRESH_CONFIG, ANNOUNCEMENT, RESTART_APP, SYNC_NOW, RELOAD_CATALOG]
+        payload: { type: object, additionalProperties: true }
+
+    RemoteCommand:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        device_id: { type: string, format: uuid }
+        command: { type: string }
+        payload: { type: object, additionalProperties: true }
+        status: { type: string, enum: [QUEUED, SENT, ACKED, FAILED] }
+        issued_at: { type: string, format: date-time }
+        acked_at: { type: string, format: date-time, nullable: true }
+        error: { type: string }
+
+    GuestCheckinRequest:
+      type: object
+      required: [guest_name]
+      properties:
+        guest_name: { type: string, example: Hendra Wijaya }
+        guest_salutation: { type: string, example: Bpk. }
+        checkin_at: { type: string, format: date-time }
+        checkout_at: { type: string, format: date-time, nullable: true }
+
+    Room:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        room_number: { type: string }
+        deck: { type: string }
+        room_type: { type: string, enum: [STANDARD, EXCLUSIVE, VIP] }
+        is_exclusive: { type: boolean }
+        guest_name: { type: string }
+        guest_salutation: { type: string }
+        guest_checkin_at: { type: string, format: date-time, nullable: true }
+        guest_checkout_at: { type: string, format: date-time, nullable: true }
+        status: { type: string, enum: [ACTIVE, MAINTENANCE] }
+
+    AnnouncementUpsertRequest:
+      type: object
+      required: [message]
+      properties:
+        message: { type: string }
+        severity: { type: string, enum: [INFO, WARNING, EMERGENCY] }
+        active_from: { type: string, format: date-time }
+        active_to: { type: string, format: date-time }
+        is_active: { type: boolean }
+
+    MovieUpsertRequest:
+      type: object
+      properties:
+        title: { type: string }
+        slug: { type: string }
+        year: { type: integer }
+        duration_seconds: { type: integer }
+        genres:
+          type: array
+          items: { type: string }
+        synopsis: { type: string }
+        tagline: { type: string }
+        director: { type: string }
+        cast:
+          type: array
+          items: { type: string }
+        country: { type: string }
+        original_language: { type: string }
+        age_rating: { type: string }
+        quality: { type: string }
+        is_featured: { type: boolean }
+        sort_order: { type: integer }
+        status: { type: string, enum: [DRAFT, PENDING, READY, MISSING, FAILED] }
+
+    SyncJobRequest:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string, enum: [MEDIA_RESCAN, LAYOUT_PUSH, CLOUD_PULL, APK_DISTRIBUTE] }
+        node_id: { type: string, format: uuid }
+        payload: { type: object, additionalProperties: true }
+
+    SyncJob:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        node_id: { type: string, format: uuid, nullable: true }
+        type: { type: string }
+        status: { type: string, enum: [QUEUED, RUNNING, COMPLETED, FAILED] }
+        bytes_total: { type: integer, format: int64 }
+        bytes_done: { type: integer, format: int64 }
+        error: { type: string }
+        created_at: { type: string, format: date-time }
+
+    MediaScanRun:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        trigger: { type: string, enum: [STARTUP, SCHEDULED, MANUAL, SYNC_JOB] }
+        root_dir: { type: string }
+        status: { type: string, enum: [RUNNING, COMPLETED, FAILED] }
+        files_found: { type: integer }
+        files_added: { type: integer }
+        files_updated: { type: integer }
+        files_missing: { type: integer }
+        error: { type: string }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time, nullable: true }
+
+    TenantOverview:
+      type: object
+      properties:
+        total_rooms: { type: integer, format: int64 }
+        total_devices: { type: integer, format: int64 }
+        online_devices: { type: integer, format: int64 }
+        total_movies: { type: integer, format: int64, description: 'Master catalog count from stayin_main' }
+        ready_movies: { type: integer, format: int64, description: 'READY files from stayin_local' }
+        pending_local_movies: { type: integer, format: int64 }
+        active_announcements: { type: integer, format: int64 }
+        storage_used_bytes: { type: integer, format: int64 }
+        local_db_connected: { type: boolean }
+
+    AdminOverview:
+      type: object
+      properties:
+        total_tenants: { type: integer, format: int64 }
+        active_tenants: { type: integer, format: int64 }
+        total_nodes: { type: integer, format: int64 }
+        online_nodes: { type: integer, format: int64 }
+        total_devices: { type: integer, format: int64 }
+        online_devices: { type: integer, format: int64 }
+        total_movies: { type: integer, format: int64 }
+        pending_movies: { type: integer, format: int64 }
+        ready_movies: { type: integer, format: int64 }
+        total_watch_logs: { type: integer, format: int64 }
+        storage_used_bytes: { type: integer, format: int64 }
+        local_db_connected: { type: boolean }
+
+    TopMovie:
+      type: object
+      properties:
+        movie_id: { type: string, format: uuid }
+        title: { type: string }
+        watch_count: { type: integer, format: int64 }
+        total_seconds: { type: integer, format: int64 }
+
+    TrendPoint:
+      type: object
+      properties:
+        date: { type: string, format: date }
+        count: { type: integer, format: int64 }
+
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness and database readiness
+      responses:
+        '200': { description: Healthy }
+        '503': { description: Database unavailable }
+
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      summary: Admin login
+      description: Returns a token pair and also sets `access_token` and `refresh_token` httpOnly cookies.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: Authenticated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  message: { type: string }
+                  data: { $ref: '#/components/schemas/LoginResponse' }
+        '401': { description: Invalid credentials, $ref response: '#/components/schemas/ErrorEnvelope' }
+        '403': { description: Account disabled }
+
+  /api/v1/auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Rotate the token pair
+      responses:
+        '200': { description: New tokens issued }
+        '401': { description: Refresh token invalid }
+
+  /api/v1/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Clear session cookies
+      responses:
+        '200': { description: Logged out }
+
+  /api/v1/auth/device/pair:
+    post:
+      tags: [Device]
+      summary: Bind a TV to a cabin using a pairing code
+      description: |
+        The TV displays a code, the crew enters it in the CMS, and the TV posts it
+        here. The response carries the long lived device token which the TV stores
+        in secure storage. The pairing code is consumed and cannot be reused.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DevicePairRequest' }
+      responses:
+        '200':
+          description: Paired
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  message: { type: string }
+                  data: { $ref: '#/components/schemas/DevicePairResponse' }
+        '401': { description: Pairing code invalid or expired }
+        '409': { description: device_uid already bound to another device }
+
+  /api/v1/tv/init:
+    get:
+      tags: [Device]
+      summary: Full boot payload for a TV
+      description: |
+        Returns device identity, room personalisation (including the substituted
+        greeting for VIP cabins), the active layout document, the whole catalog
+        already grouped into rows, active announcements and server metadata.
+        The TV calls this on every launch and after any `REFRESH_CONFIG` event.
+      security:
+        - deviceToken: []
+      parameters:
+        - name: device_id
+          in: query
+          description: Optional. When present it must match the token owner.
+          schema: { type: string }
+      responses:
+        '200':
+          description: Boot payload
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  message: { type: string }
+                  data: { $ref: '#/components/schemas/TVInitResponse' }
+        '401': { description: Device token missing or invalid }
+        '403': { description: Device disabled or tenant suspended }
+
+  /api/v1/tv/movies/{movieID}:
+    get:
+      tags: [Device]
+      summary: Movie detail with metadata and subtitle paths
+      security:
+        - deviceToken: []
+      parameters:
+        - $ref: '#/components/parameters/MovieID'
+      responses:
+        '200':
+          description: Detail
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/MovieDetail' }
+        '404': { description: Movie not playable }
+
+  /api/v1/tv/heartbeat:
+    post:
+      tags: [Device]
+      summary: Presence ping
+      security:
+        - deviceToken: []
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HeartbeatRequest' }
+      responses:
+        '200': { description: Recorded }
+
+  /api/v1/tv/watch-logs:
+    post:
+      tags: [Device]
+      summary: Save resume position
+      security:
+        - deviceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WatchLogRequest' }
+      responses:
+        '200': { description: Stored }
+
+  /api/v1/tv/resume:
+    get:
+      tags: [Device]
+      summary: Continue watching list
+      security:
+        - deviceToken: []
+      responses:
+        '200': { description: Items }
+
+  /api/v1/tv/commands:
+    get:
+      tags: [Device]
+      summary: Pending commands (drained after reconnect)
+      security:
+        - deviceToken: []
+      responses:
+        '200': { description: Items }
+
+  /api/v1/tv/commands/{commandID}/ack:
+    post:
+      tags: [Device]
+      summary: Acknowledge a command
+      security:
+        - deviceToken: []
+      parameters:
+        - name: commandID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { description: Acknowledged }
+        '403': { description: Command belongs to another device }
+
+  /api/v1/stream/{movieID}:
+    get:
+      tags: [Media]
+      summary: Byte-range video stream
+      description: |
+        Serves the media file with full HTTP range support. This is the endpoint
+        the TV player uses, and it is the only one that does not return the JSON
+        envelope.
+
+        * `Accept-Ranges: bytes` on every response.
+        * `206 Partial Content` with `Content-Range` when a range is requested.
+        * `416 Requested Range Not Satisfiable` when the range is outside the file.
+        * `304 Not Modified` when `If-None-Match` matches the ETag.
+        * `HEAD` returns headers only, so the player can size the file first.
+
+        Files are opened with a bounded open-file slot, and reads use a pooled
+        buffer, so many concurrent TVs do not exhaust memory or file handles.
+      parameters:
+        - $ref: '#/components/parameters/MovieID'
+        - name: Range
+          in: header
+          description: 'Examples: `bytes=0-1048575`, `bytes=1048570-`, `bytes=-65536`'
+          schema: { type: string }
+      responses:
+        '200': { description: Full content }
+        '206': { description: Partial content }
+        '304': { description: Not modified }
+        '404': { description: Movie or file missing }
+        '416': { description: Range not satisfiable }
+    head:
+      tags: [Media]
+      summary: Stream metadata
+      parameters:
+        - $ref: '#/components/parameters/MovieID'
+      responses:
+        '200': { description: Headers only }
+
+  /api/v1/assets/{path}:
+    get:
+      tags: [Media]
+      summary: Posters, banners, subtitles and APK files
+      description: Paths are relative to the media root. Traversal outside the root is rejected.
+      parameters:
+        - name: path
+          in: path
+          required: true
+          schema: { type: string, example: Movies/poster.jpg }
+      responses:
+        '200': { description: File }
+        '403': { description: Path escapes the media root }
+        '404': { description: Not found }
+
+  /api/v1/admin/overview:
+    get:
+      tags: [Admin]
+      summary: Landing dashboard (role aware)
+      security:
+        - adminAuth: []
+      responses:
+        '200':
+          description: Super admin sees fleet totals, tenant admin sees its own scope
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    oneOf:
+                      - $ref: '#/components/schemas/AdminOverview'
+                      - $ref: '#/components/schemas/TenantOverview'
+
+  /api/v1/admin/overview/trend:
+    get:
+      tags: [Admin]
+      summary: Daily watch counts
+      security:
+        - adminAuth: []
+      parameters:
+        - name: days
+          in: query
+          schema: { type: integer, default: 7 }
+      responses:
+        '200': { description: Series }
+
+  /api/v1/admin/overview/top-movies:
+    get:
+      tags: [Admin]
+      summary: Most watched titles
+      security:
+        - adminAuth: []
+      parameters:
+        - name: days
+          in: query
+          schema: { type: integer, default: 30 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 10 }
+      responses:
+        '200': { description: Ranked list }
+
+  /api/v1/admin/devices:
+    get:
+      tags: [Admin]
+      summary: List TVs (super admin sees all tenants)
+      security:
+        - adminAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - name: status
+          in: query
+          schema: { type: string, enum: [UNPAIRED, ONLINE, OFFLINE, DISABLED] }
+        - name: search
+          in: query
+          schema: { type: string }
+        - name: room_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: tenant_id
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { description: Devices }
+
+  /api/v1/admin/devices/{deviceID}/commands:
+    post:
+      tags: [Admin]
+      summary: Send a remote command
+      description: |
+        Delivered immediately over WebSocket when the TV is connected. While the
+        TV is offline the command stays `QUEUED` and is drained by
+        `GET /api/v1/tv/commands` on the next connection.
+      security:
+        - adminAuth: []
+      parameters:
+        - $ref: '#/components/parameters/DeviceID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CommandRequest' }
+      responses:
+        '201':
+          description: Command created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/RemoteCommand' }
+
+  /api/v1/admin/commands:
+    get:
+      tags: [Admin]
+      summary: Command history
+      security:
+        - adminAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200': { description: History }
+
+  /api/v1/admin/sync-jobs:
+    get:
+      tags: [Admin]
+      summary: Sync queue
+      security:
+        - adminAuth: []
+      responses:
+        '200': { description: Jobs }
+    post:
+      tags: [Admin]
+      summary: Enqueue a sync job
+      security:
+        - adminAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SyncJobRequest' }
+      responses:
+        '201': { description: Queued }
+
+  /api/v1/admin/sync-jobs/{jobID}/retry:
+    post:
+      tags: [Admin]
+      summary: Requeue a failed job
+      security:
+        - adminAuth: []
+      parameters:
+        - name: jobID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { description: Requeued }
+
+  /api/v1/admin/scans:
+    get:
+      tags: [Admin]
+      summary: Ingest run history
+      security:
+        - adminAuth: []
+      responses:
+        '200': { description: Runs }
+    post:
+      tags: [Admin]
+      summary: Trigger a storage scan now
+      description: |
+        Walks the shared movie directory, derives metadata from filenames or
+        `catalog.json`, computes checksums in the background, and writes catalog
+        rows whose `file_path` maps each file to its stream URL.
+      security:
+        - adminAuth: []
+      responses:
+        '200':
+          description: Completed run
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/MediaScanRun' }
+
+  /api/v1/admin/tenants:
+    get:
+      tags: [Admin]
+      summary: List whitelabel tenants (super admin)
+      security:
+        - adminAuth: []
+      responses:
+        '200': { description: Tenants }
+    post:
+      tags: [Admin]
+      summary: Create a tenant (super admin)
+      security:
+        - adminAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [slug, name]
+              properties:
+                slug: { type: string }
+                name: { type: string }
+                branding: { type: object, additionalProperties: true }
+                license_quota: { type: integer }
+      responses:
+        '201': { description: Created }
+        '409': { description: Slug already used }
+
+  /api/v1/admin/tenants/{tenantID}:
+    put:
+      tags: [Admin]
+      summary: Update a tenant (super admin)
+      security:
+        - adminAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TenantID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                slug: { type: string }
+                name: { type: string }
+                branding: { type: object, additionalProperties: true }
+                license_quota: { type: integer }
+      responses:
+        '200': { description: Updated }
+
+  /api/v1/admin/tenants/{tenantID}/status:
+    post:
+      tags: [Admin]
+      summary: Suspend or reactivate a tenant (super admin)
+      security:
+        - adminAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TenantID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [ACTIVE, SUSPENDED] }
+      responses:
+        '200': { description: Updated }
+
+  /api/v1/admin/users:
+    get:
+      tags: [Admin]
+      summary: List admin accounts
+      security:
+        - adminAuth: []
+      responses:
+        '200': { description: Users }
+    post:
+      tags: [Admin]
+      summary: Create an admin account
+      security:
+        - adminAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, full_name, role, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, format: password }
+                full_name: { type: string }
+                role: { type: string, enum: [SUPER_ADMIN, TENANT_ADMIN] }
+                tenant_id: { type: string, format: uuid }
+                status: { type: string, enum: [ACTIVE, DISABLED] }
+      responses:
+        '201': { description: Created }
+
+  /api/v1/admin/nodes:
+    get:
+      tags: [Admin]
+      summary: List edge nodes (super admin)
+      security:
+        - adminAuth: []
+      responses:
+        '200': { description: Nodes }
+
+  /api/v1/admin/audit-logs:
+    get:
+      tags: [Admin]
+      summary: Audit trail (super admin sees all tenants)
+      security:
+        - adminAuth: []
+      responses:
+        '200': { description: Entries }
+
+  /api/v1/admin/movies:
+    get:
+      tags: [Admin]
+      summary: Cross-tenant content library (super admin)
+      parameters:
+        - name: tenant_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: status
+          in: query
+          schema: { type: string, enum: [DRAFT, PENDING, PUBLISHED, ARCHIVED] }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      security:
+        - adminAuth: []
+      responses:
+        '200':
+          description: Master entries with ship file state
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/MovieWithLocal' }
+    post:
+      tags: [Admin]
+      summary: Register a movie for any tenant (super admin)
+      description: Same body as the tenant endpoint, plus tenant_id.
+      security:
+        - adminAuth: []
+      responses:
+        '201': { description: MovieWithLocal }
+
+  /api/v1/admin/me:
+    get:
+      tags: [Admin]
+      summary: Current account
+      security:
+        - adminAuth: []
+      responses:
+        '200': { description: Profile }
+
+  /api/v1/admin/me/password:
+    put:
+      tags: [Admin]
+      summary: Change password
+      security:
+        - adminAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [old_password, new_password]
+              properties:
+                old_password: { type: string, format: password }
+                new_password: { type: string, format: password }
+      responses:
+        '200': { description: Changed, session cookies cleared }
+
+  /api/v1/tenant/overview:
+    get:
+      tags: [Tenant]
+      summary: Partner dashboard
+      security:
+        - adminAuth: []
+      responses:
+        '200':
+          description: Aggregate
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/TenantOverview' }
+
+  /api/v1/tenant/movies:
+    get:
+      tags: [Tenant]
+      summary: Catalog of the caller tenant
+      security:
+        - adminAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - name: status
+          in: query
+          schema: { type: string, enum: [DRAFT, PENDING, PUBLISHED, ARCHIVED] }
+        - name: genre
+          in: query
+          schema: { type: string }
+        - name: search
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Master entries joined with the ship file state
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/MovieWithLocal' }
+    post:
+      tags: [Tenant]
+      summary: Register a movie in the master catalog as PENDING
+      description: |
+        No video is uploaded. The entry waits until the file reaches the ship,
+        either by network transfer or by flashdisk. expected_filename is how the
+        local ingest engine binds the arriving file to this catalog entry.
+      security:
+        - adminAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, expected_filename]
+              properties:
+                title: { type: string }
+                year: { type: integer }
+                genres:
+                  type: array
+                  items: { type: string }
+                synopsis: { type: string }
+                director: { type: string }
+                expected_filename: { type: string, example: 'Film 2024 1080p.mkv' }
+                publish: { type: boolean, description: 'true = PENDING + enqueue distribution; false = DRAFT' }
+      responses:
+        '201': { description: MovieWithLocal }
+
+  /api/v1/tenant/inventory:
+    get:
+      tags: [Tenant]
+      summary: Rows of mst_movie_local (real files on the ship)
+      security:
+        - adminAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - name: status
+          in: query
+          schema: { type: string, enum: [PENDING, TRANSFERRING, READY, MISSING, FAILED] }
+        - name: source
+          in: query
+          schema: { type: string, enum: [CLOUD, FLASHDISK] }
+      responses:
+        '200': { description: Local inventory }
+
+  /api/v1/nodes/inventory:
+    post:
+      tags: [Node]
+      summary: Local server reports its mst_movie_local inventory
+      description: |
+        Authenticated with the shared X-Node-Key header. Every movie reported as
+        READY is promoted to PUBLISHED in the master catalog.
+      parameters:
+        - name: X-Node-Key
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenant_id, node_code, items]
+              properties:
+                tenant_id: { type: string, format: uuid }
+                node_code: { type: string }
+                items:
+                  type: array
+                  items: { $ref: '#/components/schemas/MovieLocal' }
+      responses:
+        '200': { description: Inventory stored }
+
+  /api/v1/tenant/movies/{movieID}:
+    get:
+      tags: [Tenant]
+      summary: Movie with details
+      security:
+        - adminAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MovieID'
+      responses:
+        '200': { description: Movie and detail }
+    put:
+      tags: [Tenant]
+      summary: Update metadata (marks the row as MANUAL)
+      security:
+        - adminAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MovieID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MovieUpsertRequest' }
+      responses:
+        '200': { description: Updated }
+    delete:
+      tags: [Tenant]
+      summary: Remove from catalog (the file on disk is kept)
+      security:
+        - adminAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MovieID'
+      responses:
+        '200': { description: Deleted }
+
+  /api/v1/tenant/rooms:
+    get:
+      tags: [Tenant]
+      summary: List cabins
+      security:
+        - adminAuth: []
+      responses:
+        '200': { description: Rooms }
+    post:
+      tags: [Tenant]
+      summary: Create a cabin
+      security:
+        - adminAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [room_number]
+              properties:
+                room_number: { type: string }
+                deck: { type: string }
+                room_type: { type: string, enum: [STANDARD, EXCLUSIVE, VIP] }
+                is_exclusive: { type: boolean }
+      responses:
+        '201': { description: Created }
+
+  /api/v1/tenant/rooms/{roomID}/guest:
+    post:
+      tags: [Tenant]
+      summary: Check in a VIP guest and push the greeting to the cabin TV
+      description: |
+        Writes the guest to the room, then emits `ROOM_GUEST_UPDATED` over
+        WebSocket to every TV installed in that cabin. The TV updates its
+        welcome screen without restarting.
+      security:
+        - adminAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RoomID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GuestCheckinRequest' }
+      responses:
+        '200': { description: Room with the guest applied }
+    delete:
+      tags: [Tenant]
+      summary: Check out the guest
+      security:
+        - adminAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RoomID'
+      responses:
+        '200': { description: Cleared }
+
+  /api/v1/tenant/layout:
+    get:
+      tags: [Tenant]
+      summary: Active layout document
+      security:
+        - adminAuth: []
+      responses:
+        '200':
+          description: Layout
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/LayoutConfig' }
+    put:
+      tags: [Tenant]
+      summary: Publish a new layout version
+      description: |
+        Stores the document as a new version, deactivates the previous one, and
+        broadcasts `REFRESH_CONFIG` to every TV of the tenant.
+      security:
+        - adminAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [config]
+              properties:
+                config: { $ref: '#/components/schemas/LayoutConfig' }
+      responses:
+        '200': { description: Published }
+        '400': { description: Invalid variant or missing app_title }
+
+  /api/v1/tenant/announcements:
+    get:
+      tags: [Tenant]
+      summary: List announcements
+      security:
+        - adminAuth: []
+      responses:
+        '200': { description: Announcements }
+    post:
+      tags: [Tenant]
+      summary: Publish a running text message
+      description: Broadcasts `ANNOUNCEMENT` to every TV of the tenant.
+      security:
+        - adminAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AnnouncementUpsertRequest' }
+      responses:
+        '201': { description: Created }
+
+  /api/v1/tenant/announcements/{announcementID}:
+    put:
+      tags: [Tenant]
+      summary: Update an announcement
+      security:
+        - adminAuth: []
+      parameters:
+        - name: announcementID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AnnouncementUpsertRequest' }
+      responses:
+        '200': { description: Updated }
+    delete:
+      tags: [Tenant]
+      summary: Delete an announcement
+      security:
+        - adminAuth: []
+      parameters:
+        - name: announcementID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { description: Deleted }
+
+  /api/v1/tenant/devices:
+    get:
+      tags: [Tenant]
+      summary: List TVs of the tenant
+      security:
+        - adminAuth: []
+      responses:
+        '200': { description: Devices }
+
+  /ws/tv:
+    get:
+      summary: Device WebSocket hub
+      description: |
+        Requires the device token as `?token=` or the `Authorization` header.
+
+        Server to client events:
+
+        * `WELCOME` — `{ device_id, tenant_id, room_id, server_time }`
+        * `COMMAND` — `{ id, command, data }`, replayed for queued commands on connect
+        * `REFRESH_CONFIG` — layout changed, refetch `/tv/init`
+        * `ROOM_GUEST_UPDATED` — VIP guest changed, update the welcome screen
+        * `ANNOUNCEMENT` — running text changed
+        * `CONTENT_UPDATED` — catalog changed, refetch `/tv/init`
+        * `APK_AVAILABLE` — a new TV package is downloadable
+
+        Client to server events:
+
+        * `HEARTBEAT` — `{ app_version, state }`
+        * `ACK` — `{ command_id }`
+        * `PING` — answered with `PONG`
+      parameters:
+        - name: token
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '101': { description: Switching protocols }
+
+  /ws/remote:
+    get:
+      summary: Passenger phone remote WebSocket
+      description: |
+        The phone sends `{ type: "KEY", payload: { key: "UP"|"DOWN"|"LEFT"|"RIGHT"|"OK"|"BACK"|"PLAY_PAUSE" } }`
+        and the hub forwards it to every TV in the room as a `KEY` event. The
+        sender receives `KEY_ACK` with a delivery count.
+      parameters:
+        - name: room_id
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+        - name: tenant_id
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '101': { description: Switching protocols }
